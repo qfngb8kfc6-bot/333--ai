@@ -1,51 +1,65 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, HttpUrl
 import requests
 from bs4 import BeautifulSoup
-import openai
+from openai import OpenAI
 import os
 
 app = FastAPI()
 
-openai.api_key = os.getenv("OPENAI_API_KEY")
+# Load OpenAI client securely
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 class RecommendRequest(BaseModel):
-    url: str
+    url: HttpUrl
+
+
+@app.get("/")
+def health_check():
+    return {"status": "AI Website Analyzer is running"}
 
 
 @app.post("/recommend")
 def recommend(data: RecommendRequest):
     try:
         # Fetch website
-        response = requests.get(data.url, timeout=10)
+        response = requests.get(str(data.url), timeout=10)
         response.raise_for_status()
 
-        # Parse content
+        # Parse HTML
         soup = BeautifulSoup(response.text, "html.parser")
 
         # Remove scripts/styles
-        for script in soup(["script", "style"]):
-            script.extract()
+        for script in soup(["script", "style", "noscript"]):
+            script.decompose()
 
+        # Extract clean text
         text = soup.get_text(separator=" ", strip=True)
-        text = text[:4000]  # Limit for token safety
+
+        # Limit size (important for token limits)
+        text = text[:6000]
+
+        if not text.strip():
+            raise HTTPException(status_code=400, detail="No readable content found on site.")
 
         # AI Analysis
-        ai_response = openai.ChatCompletion.create(
+        completion = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a business intelligence AI that analyzes websites and extracts relevant content."
+                    "content": "You are a website intelligence AI that extracts meaningful business insights."
                 },
                 {
                     "role": "user",
                     "content": f"""
 Analyze the following website content.
 
-1. Extract the most relevant content from the site.
-2. Explain why this content is important.
-3. Give reasoning and guidance tailored to a potential client.
+Return your answer in 3 sections:
+
+1. Relevant Content Found
+2. Why This Content Is Important
+3. Tailored Guidance For A Potential Client
 
 Website Content:
 {text}
@@ -56,8 +70,11 @@ Website Content:
         )
 
         return {
-            "response": ai_response.choices[0].message["content"]
+            "analysis": completion.choices[0].message.content
         }
 
+    except requests.exceptions.RequestException:
+        raise HTTPException(status_code=400, detail="Failed to fetch website. Ensure URL includes https://")
+
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
