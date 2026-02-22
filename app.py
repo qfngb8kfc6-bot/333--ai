@@ -8,7 +8,7 @@ import os
 
 app = FastAPI()
 
-# ✅ CORS CONFIGURATION
+# ✅ CORS CONFIG
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -19,8 +19,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load OpenAI client securely
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# ✅ Load OpenAI API key
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+if not OPENAI_API_KEY:
+    print("🔥 ERROR: OPENAI_API_KEY is missing!")
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
 
 class RecommendRequest(BaseModel):
     url: HttpUrl
@@ -48,13 +54,16 @@ def recommend(data: RecommendRequest):
         # Extract clean text
         text = soup.get_text(separator=" ", strip=True)
 
-        # Limit size (important for token limits)
+        # Limit size for token safety
         text = text[:6000]
 
         if not text.strip():
-            raise HTTPException(status_code=400, detail="No readable content found on site.")
+            raise HTTPException(
+                status_code=400,
+                detail="No readable content found on site."
+            )
 
-        # AI Analysis
+        # 🔥 OpenAI Analysis
         completion = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
@@ -85,15 +94,18 @@ Website Content:
             "analysis": completion.choices[0].message.content
         }
 
-    except requests.exceptions.RequestException:
+    except requests.exceptions.RequestException as e:
+        print("🔥 REQUEST ERROR:", str(e))
         raise HTTPException(
             status_code=400,
             detail="Failed to fetch website. Ensure URL includes https://"
         )
 
-    except Exception:
-        # Don't expose raw OpenAI errors in production
+    except Exception as e:
+        # 🔥 THIS IS WHAT WE NEED TO SEE IN RENDER LOGS
+        print("🔥 OPENAI OR INTERNAL ERROR:", str(e))
         raise HTTPException(
             status_code=500,
-            detail="AI service temporarily unavailable."
+            detail=str(e)
         )
+
