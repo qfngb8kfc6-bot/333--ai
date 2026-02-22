@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 import requests
 from bs4 import BeautifulSoup
@@ -6,6 +7,17 @@ from openai import OpenAI
 import os
 
 app = FastAPI()
+
+# ✅ CORS CONFIGURATION
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://qfngb8kfc6-bot.github.io"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Load OpenAI client securely
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -74,7 +86,14 @@ Website Content:
         }
 
     except requests.exceptions.RequestException:
-        raise HTTPException(status_code=400, detail="Failed to fetch website. Ensure URL includes https://")
+        raise HTTPException(
+            status_code=400,
+            detail="Failed to fetch website. Ensure URL includes https://"
+        )
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        # Don't expose raw OpenAI errors in production
+        raise HTTPException(
+            status_code=500,
+            detail="AI service temporarily unavailable."
+        )
