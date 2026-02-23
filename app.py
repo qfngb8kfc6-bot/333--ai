@@ -1,111 +1,160 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl
-import requests
-from bs4 import BeautifulSoup
-from openai import OpenAI
 import os
+import re
+import asyncio
+from urllib.parse import urljoin, urlparse
+
+import httpx
+from bs4 import BeautifulSoup
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from openai import OpenAI
+
+
+# -----------------------------------
+# Setup
+# -----------------------------------
 
 app = FastAPI()
 
-# ✅ CORS CONFIG
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://qfngb8kfc6-bot.github.io"
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ✅ Load OpenAI API key
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not OPENAI_API_KEY:
-    print("🔥 ERROR: OPENAI_API_KEY is missing!")
+    raise Exception("OPENAI_API_KEY is missing!")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 
-class RecommendRequest(BaseModel):
-    url: HttpUrl
+class URLRequest(BaseModel):
+    url: str
 
 
-@app.get("/")
-def health_check():
-    return {"status": "AI Website Analyzer is running"}
+# -----------------------------------
+# AI Summarizer
+# -----------------------------------
 
-
-@app.post("/recommend")
-def recommend(data: RecommendRequest):
+async def summarize_with_ai(text: str) -> str:
     try:
-        # Fetch website
-        response = requests.get(str(data.url), timeout=10)
-        response.raise_for_status()
-
-        # Parse HTML
-        soup = BeautifulSoup(response.text, "html.parser")
-
-        # Remove scripts/styles
-        for script in soup(["script", "style", "noscript"]):
-            script.decompose()
-
-        # Extract clean text
-        text = soup.get_text(separator=" ", strip=True)
-
-        # Limit size for token safety
-        text = text[:6000]
-
-        if not text.strip():
-            raise HTTPException(
-                status_code=400,
-                detail="No readable content found on site."
-            )
-
-        # 🔥 OpenAI Analysis
-        completion = client.chat.completions.create(
-            model="gpt-4o-mini",
+        response = await asyncio.to_thread(
+            client.chat.completions.create,
+            model="gpt-4o-mini",  # cheaper + fast
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a website intelligence AI that extracts meaningful business insights."
+                    "content": "Summarize this article in 2 concise sentences for a business audience."
                 },
                 {
                     "role": "user",
-                    "content": f"""
-Analyze the following website content.
-
-Return your answer in 3 sections:
-
-1. Relevant Content Found
-2. Why This Content Is Important
-3. Tailored Guidance For A Potential Client
-
-Website Content:
-{text}
-"""
+                    "content": text[:4000]
                 }
             ],
-            temperature=0.7,
+            temperature=0.3
         )
 
-        return {
-            "analysis": completion.choices[0].message.content
-        }
-
-    except requests.exceptions.RequestException as e:
-        print("🔥 REQUEST ERROR:", str(e))
-        raise HTTPException(
-            status_code=400,
-            detail="Failed to fetch website. Ensure URL includes https://"
-        )
+        return response.choices[0].message.content.strip()
 
     except Exception as e:
-        # 🔥 THIS IS WHAT WE NEED TO SEE IN RENDER LOGS
-        print("🔥 OPENAI OR INTERNAL ERROR:", str(e))
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
+        return f"AI summary failed: {str(e)}"
 
+
+# -----------------------------------
+# Async Article Fetcher
+# -----------------------------------
+
+async def fetch_article(client_http, url):
+    try:
+        resp = await client_http.get(url, timeout=10)
+        resp.raise_for_status()
+    except:
+        return None
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    title_tag = soup.find("h1")
+    title = title_tag.get_text(strip=True) if title_tag else "No title"
+
+    content_text = ""
+    for p in soup.find_all("p"):
+        text = p.get_text(strip=True)
+        if len(text) > 80:
+            content_text += text + " "
+
+    if not content_text:
+        return None
+
+    ai_summary = await summarize_with_ai(content_text)
+
+    return {
+        "title": title,
+        "url": url,
+        "ai_summary": ai_summary
+    }
+
+
+# -----------------------------------
+# Main Scraper
+# -----------------------------------
+
+async def scrape_articles_async(base_url, max_articles=5):
+
+    if not base_url.startswith(("http://", "https://")):
+        base_url = "https://" + base_url.strip()
+
+    parsed_base = urlparse(base_url)
+
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
+    async with httpx.AsyncClient(headers=headers) as client_http:
+        try:
+            resp = await client_http.get(base_url, timeout=10)
+            resp.raise_for_status()
+        except Exception as e:
+            return {"articles": [], "error": f"Failed to fetch site: {str(e)}"}
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        article_links = set()
+
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            full_url = urljoin(base_url, href)
+
+            parsed_full = urlparse(full_url)
+
+            if parsed_full.netloc != parsed_base.netloc:
+                continue
+
+            if re.search(r"(news|article|blog|/20\d{2}/)", full_url.lower()):
+                article_links.add(full_url)
+
+            if len(article_links) >= max_articles:
+                break
+
+        tasks = [
+            fetch_article(client_http, url)
+            for url in list(article_links)[:max_articles]
+        ]
+
+        results = await asyncio.gather(*tasks)
+
+        articles = [r for r in results if r is not None]
+
+        return {
+            "articles": articles,
+            "error": None
+        }
+
+
+# -----------------------------------
+# API Endpoint
+# -----------------------------------
+
+@app.post("/recommend")
+async def recommend(data: URLRequest):
+    result = await scrape_articles_async(data.url)
+
+    if result["error"]:
+        raise HTTPException(status_code=500, detail=result["error"])
+
+    return result
