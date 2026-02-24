@@ -8,147 +8,169 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+# --------------------------------------------------
+# CONFIG
+# --------------------------------------------------
+
+BASE_SITE = "https://www.sgieurope.com"
+MAX_PAGES_TO_SCAN = 20
+TOP_RESULTS = 5
+
 app = FastAPI()
 
-# -------------------------
-# CORS (ALLOW ALL FOR NOW)
-# -------------------------
+# --------------------------------------------------
+# CORS (Allow widget access)
+# --------------------------------------------------
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Lock down later if needed
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -------------------------
+# --------------------------------------------------
 # Request Model
-# -------------------------
-class RecommendRequest(BaseModel):
-    url: str
-    client_niche: str
+# --------------------------------------------------
+
+class ProfileRequest(BaseModel):
+    profile: str
 
 
-# -------------------------
-# Extract Article Links
-# -------------------------
-def extract_article_links(base_url: str, soup: BeautifulSoup) -> List[str]:
-    article_links = set()
+# --------------------------------------------------
+# Extract Internal Links From SGI Europe
+# --------------------------------------------------
+
+def extract_internal_links(base_url: str, soup: BeautifulSoup) -> List[str]:
+    links = set()
     parsed_base = urlparse(base_url)
     base_domain = parsed_base.netloc
 
     for a in soup.find_all("a", href=True):
         href = a["href"]
 
-        # Skip fragments
-        if "#" in href:
+        if href.startswith("#"):
             continue
 
         full_url = urljoin(base_url, href)
         parsed = urlparse(full_url)
 
-        # Keep only same domain
+        # Keep only SGI Europe domain
         if parsed.netloc != base_domain:
             continue
 
-        path_parts = parsed.path.strip("/").split("/")
-
-        # Must have at least 2 segments (avoid homepage + categories)
-        if len(path_parts) < 2:
+        # Remove homepage
+        if parsed.path in ["", "/"]:
             continue
 
-        # Skip short paths (usually categories)
-        if len(parsed.path) < 20:
-            continue
+        links.add(full_url)
 
-        article_links.add(full_url)
-
-    return list(article_links)
+    return list(links)
 
 
-# -------------------------
-# Score Relevance
-# -------------------------
-def score_relevance(text: str, niche: str) -> int:
-    niche_words = niche.lower().split()
+# --------------------------------------------------
+# Simple Keyword Relevance Scoring
+# --------------------------------------------------
+
+def score_relevance(page_text: str, profile: str):
+    profile_words = profile.lower().split()
+    text_lower = page_text.lower()
+
     score = 0
+    matched_words = []
 
-    for word in niche_words:
-        if word in text.lower():
-            score += 20
+    for word in profile_words:
+        if word in text_lower:
+            score += 15
+            matched_words.append(word)
 
-    return min(score, 100)
+    score = min(score, 100)
+
+    return score, matched_words
 
 
-# -------------------------
-# Scrape Single Article
-# -------------------------
-async def scrape_article(client: httpx.AsyncClient, url: str, niche: str):
+# --------------------------------------------------
+# Scrape Individual Page
+# --------------------------------------------------
+
+async def scrape_page(client: httpx.AsyncClient, url: str, profile: str):
     try:
         response = await client.get(url, timeout=10)
         soup = BeautifulSoup(response.text, "html.parser")
 
-        title = soup.title.string.strip() if soup.title else "No title"
+        title = soup.title.string.strip() if soup.title else "Untitled"
 
         paragraphs = soup.find_all("p")
-        content = " ".join([p.get_text() for p in paragraphs[:5]])
+        content = " ".join([p.get_text() for p in paragraphs[:8]])
 
-        relevance_score = score_relevance(content, niche)
+        if len(content.strip()) < 200:
+            return None
+
+        relevance_score, matched_words = score_relevance(content, profile)
+
+        if relevance_score == 0:
+            return None
 
         return {
             "title": title,
             "url": url,
-            "summary": content[:500],
+            "summary": content[:600],
             "relevance_score": relevance_score,
-            "relevance_reason": f"Matched keywords related to '{niche}'."
-            if relevance_score > 0
-            else "Low keyword overlap with niche.",
+            "relevance_reason": (
+                f"This page is relevant because it mentions: "
+                f"{', '.join(set(matched_words))}."
+            )
         }
 
     except Exception:
         return None
 
 
-# -------------------------
-# Scrape Articles Async
-# -------------------------
-async def scrape_articles_async(base_url: str, niche: str):
+# --------------------------------------------------
+# Main Scraper Logic
+# --------------------------------------------------
+
+async def scrape_sgi_europe(profile: str):
     async with httpx.AsyncClient(follow_redirects=True) as client:
-        response = await client.get(base_url, timeout=10)
+
+        # Get homepage
+        response = await client.get(BASE_SITE, timeout=10)
         soup = BeautifulSoup(response.text, "html.parser")
 
-        article_links = extract_article_links(base_url, soup)
+        links = extract_internal_links(BASE_SITE, soup)
+
+        # Limit number of pages scanned
+        links = links[:MAX_PAGES_TO_SCAN]
 
         tasks = [
-            scrape_article(client, link, niche)
-            for link in article_links[:10]  # limit to first 10
+            scrape_page(client, link, profile)
+            for link in links
         ]
 
         results = await asyncio.gather(*tasks)
 
-        articles = [r for r in results if r is not None]
+        valid_results = [r for r in results if r is not None]
 
-        # Sort by relevance
-        articles.sort(key=lambda x: x["relevance_score"], reverse=True)
+        valid_results.sort(
+            key=lambda x: x["relevance_score"],
+            reverse=True
+        )
 
-        return articles[:5]
+        return valid_results[:TOP_RESULTS]
 
 
-# -------------------------
+# --------------------------------------------------
 # API Endpoint
-# -------------------------
+# --------------------------------------------------
+
 @app.post("/recommend")
-async def recommend(request: RecommendRequest):
+async def recommend(request: ProfileRequest):
     try:
-        url = request.url.strip()
-
-        if not url.startswith("http://") and not url.startswith("https://"):
-            url = "https://" + url
-
-        articles = await scrape_articles_async(url, request.client_niche)
+        results = await scrape_sgi_europe(request.profile)
 
         return {
-            "articles": articles,
+            "articles": results,
             "error": None
         }
 
@@ -157,9 +179,3 @@ async def recommend(request: RecommendRequest):
             "articles": [],
             "error": str(e)
         }
-
-
-    if result["error"]:
-        raise HTTPException(status_code=500, detail=result["error"])
-
-    return result
