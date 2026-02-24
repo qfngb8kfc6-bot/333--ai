@@ -1,215 +1,163 @@
-import os
-import re
 import asyncio
+from typing import List
 from urllib.parse import urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from openai import OpenAI
-
-
-# -------------------------
-# Setup
-# -------------------------
 
 app = FastAPI()
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise Exception("OPENAI_API_KEY is missing!")
+# -------------------------
+# CORS (ALLOW ALL FOR NOW)
+# -------------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-
-class URLRequest(BaseModel):
+# -------------------------
+# Request Model
+# -------------------------
+class RecommendRequest(BaseModel):
     url: str
     client_niche: str
 
 
 # -------------------------
-# AI Relevance Scorer
+# Extract Article Links
 # -------------------------
-
-async def score_relevance(niche: str, title: str, summary: str):
-
-    prompt = f"""
-    Client niche: {niche}
-
-    Article:
-    Title: {title}
-    Summary: {summary}
-
-    Determine:
-    1) Relevance score from 0-100
-    2) Short explanation (1 sentence)
-
-    Return JSON only:
-    {{
-        "score": number,
-        "reason": "string"
-    }}
-    """
-
-    try:
-        response = await asyncio.to_thread(
-            client.chat.completions.create,
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2
-        )
-
-        content = response.choices[0].message.content
-
-        # crude JSON parsing safety
-        import json
-        parsed = json.loads(content)
-
-        return parsed["score"], parsed["reason"]
-
-    except:
-        return 0, "Scoring failed"
-
-
-# -------------------------
-# AI Summarizer
-# -------------------------
-
-async def summarize_with_ai(text: str):
-
-    try:
-        response = await asyncio.to_thread(
-            client.chat.completions.create,
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "Summarize this article in 2 concise sentences for business professionals."
-                },
-                {
-                    "role": "user",
-                    "content": text[:3500]
-                }
-            ],
-            temperature=0.3
-        )
-
-        return response.choices[0].message.content.strip()
-
-    except:
-        return "Summary unavailable"
-
-
-# -------------------------
-# Article Fetcher
-# -------------------------
-
-async def fetch_article(client_http, url, niche):
-
-    try:
-        resp = await client_http.get(url, timeout=10)
-        resp.raise_for_status()
-    except:
-        return None
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    title_tag = soup.find("h1")
-    title = title_tag.get_text(strip=True) if title_tag else "No title"
-
-    content_text = ""
-    for p in soup.find_all("p"):
-        text = p.get_text(strip=True)
-        if len(text) > 80:
-            content_text += text + " "
-
-    if not content_text:
-        return None
-
-    summary = await summarize_with_ai(content_text)
-
-    score, reason = await score_relevance(niche, title, summary)
-
-    if score < 60:
-        return None
-
-    return {
-        "title": title,
-        "url": url,
-        "summary": summary,
-        "relevance_score": score,
-        "relevance_reason": reason
-    }
-
-
-# -------------------------
-# Main Scraper
-# -------------------------
-
-async def scrape_articles_async(base_url, niche, max_articles=8):
-
-    if not base_url.startswith(("http://", "https://")):
-        base_url = "https://" + base_url.strip()
-
+def extract_article_links(base_url: str, soup: BeautifulSoup) -> List[str]:
+    article_links = set()
     parsed_base = urlparse(base_url)
+    base_domain = parsed_base.netloc
 
-    headers = {"User-Agent": "Mozilla/5.0"}
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
 
-    async with httpx.AsyncClient(headers=headers) as client_http:
+        # Skip fragments
+        if "#" in href:
+            continue
 
-        try:
-            resp = await client_http.get(base_url, timeout=10)
-            resp.raise_for_status()
-        except Exception as e:
-            return {"articles": [], "error": str(e)}
+        full_url = urljoin(base_url, href)
+        parsed = urlparse(full_url)
 
-        soup = BeautifulSoup(resp.text, "html.parser")
+        # Keep only same domain
+        if parsed.netloc != base_domain:
+            continue
 
-        links = set()
+        path_parts = parsed.path.strip("/").split("/")
 
-        for a in soup.find_all("a", href=True):
-            full_url = urljoin(base_url, a["href"])
-            parsed_full = urlparse(full_url)
+        # Must have at least 2 segments (avoid homepage + categories)
+        if len(path_parts) < 2:
+            continue
 
-            if parsed_full.netloc != parsed_base.netloc:
-                continue
+        # Skip short paths (usually categories)
+        if len(parsed.path) < 20:
+            continue
 
-            if re.search(r"(news|article|blog|/20\d{2}/)", full_url.lower()):
-                links.add(full_url)
+        article_links.add(full_url)
 
-            if len(links) >= max_articles:
-                break
+    return list(article_links)
+
+
+# -------------------------
+# Score Relevance
+# -------------------------
+def score_relevance(text: str, niche: str) -> int:
+    niche_words = niche.lower().split()
+    score = 0
+
+    for word in niche_words:
+        if word in text.lower():
+            score += 20
+
+    return min(score, 100)
+
+
+# -------------------------
+# Scrape Single Article
+# -------------------------
+async def scrape_article(client: httpx.AsyncClient, url: str, niche: str):
+    try:
+        response = await client.get(url, timeout=10)
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        title = soup.title.string.strip() if soup.title else "No title"
+
+        paragraphs = soup.find_all("p")
+        content = " ".join([p.get_text() for p in paragraphs[:5]])
+
+        relevance_score = score_relevance(content, niche)
+
+        return {
+            "title": title,
+            "url": url,
+            "summary": content[:500],
+            "relevance_score": relevance_score,
+            "relevance_reason": f"Matched keywords related to '{niche}'."
+            if relevance_score > 0
+            else "Low keyword overlap with niche.",
+        }
+
+    except Exception:
+        return None
+
+
+# -------------------------
+# Scrape Articles Async
+# -------------------------
+async def scrape_articles_async(base_url: str, niche: str):
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        response = await client.get(base_url, timeout=10)
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        article_links = extract_article_links(base_url, soup)
 
         tasks = [
-            fetch_article(client_http, url, niche)
-            for url in list(links)
+            scrape_article(client, link, niche)
+            for link in article_links[:10]  # limit to first 10
         ]
 
         results = await asyncio.gather(*tasks)
 
-        articles = [r for r in results if r]
+        articles = [r for r in results if r is not None]
 
-        # sort by relevance score
+        # Sort by relevance
         articles.sort(key=lambda x: x["relevance_score"], reverse=True)
+
+        return articles[:5]
+
+
+# -------------------------
+# API Endpoint
+# -------------------------
+@app.post("/recommend")
+async def recommend(request: RecommendRequest):
+    try:
+        url = request.url.strip()
+
+        if not url.startswith("http://") and not url.startswith("https://"):
+            url = "https://" + url
+
+        articles = await scrape_articles_async(url, request.client_niche)
 
         return {
             "articles": articles,
             "error": None
         }
 
+    except Exception as e:
+        return {
+            "articles": [],
+            "error": str(e)
+        }
 
-# -------------------------
-# API Endpoint
-# -------------------------
-
-@app.post("/recommend")
-async def recommend(data: URLRequest):
-
-    result = await scrape_articles_async(
-        data.url,
-        data.client_niche
-    )
 
     if result["error"]:
         raise HTTPException(status_code=500, detail=result["error"])
