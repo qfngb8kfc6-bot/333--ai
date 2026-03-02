@@ -1,25 +1,27 @@
 # ============================================================
 # app.py  (COPY + PASTE READY)
-# SGI-ONLY RECOMMENDER (NEVER leaves sgieurope.com)
+# SGI-ONLY RECOMMENDER + REAL PROGRESS (SSE)
 # ============================================================
-# What this backend does:
-# 1) Takes: job_title + website_url (visitor company site)
-# 2) Scrapes the visitor company site for signals about what they do
-# 3) Collects ONLY SGI Europe links (sgieurope.com) from:
-#    - Homepage
-#    - /home/topics
-#    - Each topic page discovered from /home/topics
-#    - Plus any additional internal SGI pages linked from those hubs
-# 4) Fetches a batch of SGI pages and produces:
-#    - short summary (AI if available; fallback otherwise)
-#    - relevance score + “why relevant” (AI if available; fallback otherwise)
-# 5) Returns top results
+# ✅ Hard guarantee: ONLY returns links from https://www.sgieurope.com
 #
-# ✅ Hard guarantee: links returned are ONLY from https://www.sgieurope.com
+# What you get:
+# 1) POST /recommend        -> (blocking) returns {articles:[...], error:null}
+# 2) POST /recommend_async  -> returns {task_id}
+# 3) GET  /progress/{id}    -> Server-Sent Events stream:
+#        event: progress
+#        data: {"pct": 42, "step": "...", "done": false}
+#      and final:
+#        event: done
+#        data: {"pct":100,"step":"Done","done":true,"result":{...}}
+#
+# Your widget progress bar becomes REAL by using /recommend_async + /progress/{id}.
+# ============================================================
 
 import os
 import re
 import json
+import uuid
+import time
 import asyncio
 from typing import List, Optional, Dict, Any, Set
 from urllib.parse import urljoin, urlparse
@@ -29,7 +31,8 @@ from bs4 import BeautifulSoup
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
+from starlette.responses import StreamingResponse
 
 # OpenAI optional: app runs without it (keyword fallback)
 try:
@@ -55,11 +58,11 @@ DEFAULT_HEADERS = {
     "Accept-Language": "en-GB,en;q=0.9",
 }
 
-# Crawl limits (keep these sane for Render free tier)
-MAX_TOPIC_PAGES = 14           # how many topic pages to crawl from /home/topics
-MAX_LINKS_TOTAL = 220          # how many SGI URLs to consider (max)
-MAX_PAGES_FETCH = 26           # how many SGI pages to fetch & analyze
-RETURN_TOP = 6                 # how many results to return
+# Crawl limits (keep sane for Render free tier)
+MAX_TOPIC_PAGES = 14
+MAX_LINKS_TOTAL = 220
+MAX_PAGES_FETCH = 26
+RETURN_TOP = 6
 
 # AI optional
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
@@ -84,11 +87,81 @@ app.add_middleware(
 
 
 # -------------------------
+# In-memory progress store
+# -------------------------
+# NOTE: In-memory works fine for a single Render instance.
+# If you scale to multiple instances, move this to Redis.
+TASKS: Dict[str, Dict[str, Any]] = {}
+TASK_LOCK = asyncio.Lock()
+TASK_TTL_SECONDS = 60 * 15  # 15 minutes
+
+
+async def set_task(task_id: str, **updates):
+    async with TASK_LOCK:
+        t = TASKS.get(task_id)
+        if not t:
+            return
+        t.update(updates)
+        t["updated_at"] = time.time()
+
+
+async def create_task_record(task_id: str):
+    async with TASK_LOCK:
+        TASKS[task_id] = {
+            "pct": 0,
+            "step": "Starting…",
+            "done": False,
+            "error": None,
+            "result": None,
+            "created_at": time.time(),
+            "updated_at": time.time(),
+        }
+
+
+async def cleanup_tasks():
+    """Remove old tasks occasionally."""
+    now = time.time()
+    async with TASK_LOCK:
+        dead = [k for k, v in TASKS.items() if (now - v.get("updated_at", now)) > TASK_TTL_SECONDS]
+        for k in dead:
+            TASKS.pop(k, None)
+
+
+# -------------------------
 # Models
 # -------------------------
 class RecommendRequest(BaseModel):
-    job_title: str
-    website_url: str
+    # Accept BOTH styles:
+    # - new: job_title + website_url
+    # - old widget: url + job_title
+    job_title: Optional[str] = None
+    website_url: Optional[str] = None
+
+    # compat fields the widget may send
+    url: Optional[str] = None
+    profile: Optional[str] = None
+    intent: Optional[str] = None
+
+    @model_validator(mode="after")
+    def normalize_fields(self):
+        # Map url -> website_url if website_url missing
+        if not self.website_url and self.url:
+            self.website_url = self.url
+
+        # If job_title missing but profile exists, try a very simple extraction
+        if not self.job_title and self.profile:
+            # naive attempt: take text before " at " if present
+            p = self.profile.strip()
+            if " at " in p.lower():
+                self.job_title = p.split(" at ")[0].strip()
+            else:
+                # otherwise just use profile as job_title fallback (better than nothing)
+                self.job_title = p[:80].strip()
+
+        if not self.job_title or not self.website_url:
+            raise ValueError("job_title and website_url are required (or send {url, job_title}).")
+
+        return self
 
 
 # -------------------------
@@ -118,14 +191,12 @@ def normalize_url(url: str) -> str:
     url = (url or "").strip()
     if not url:
         return url
-    url = url.split("#")[0]  # remove fragments
-    # strip trailing slash except root
+    url = url.split("#")[0]
     if url.endswith("/") and len(url) > len("https://x/"):
         url = url[:-1]
     return url
 
 def is_sgi_url(url: str) -> bool:
-    """Hard filter: ONLY SGI host allowed."""
     try:
         u = urlparse(url)
         return u.scheme in ("http", "https") and u.netloc == SGI_HOST
@@ -133,13 +204,10 @@ def is_sgi_url(url: str) -> bool:
         return False
 
 def absolutize_sgi(href: str) -> Optional[str]:
-    """Turn href into absolute SGI URL and enforce SGI-only."""
     if not href:
         return None
     full = normalize_url(urljoin(SGI_BASE, href))
-    if is_sgi_url(full):
-        return full
-    return None
+    return full if is_sgi_url(full) else None
 
 
 # -------------------------
@@ -147,16 +215,12 @@ def absolutize_sgi(href: str) -> Optional[str]:
 # -------------------------
 def soup_clean_text(html: str, max_chars: int = 8000) -> str:
     soup = BeautifulSoup(html, "html.parser")
-
     for tag in soup(["script", "style", "noscript", "svg", "iframe"]):
         tag.decompose()
 
-    # Add meta title/description for signal
     parts = []
 
-    title = ""
-    if soup.title:
-        title = soup.title.get_text(" ", strip=True)
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
     if title:
         parts.append(f"TITLE: {title}")
 
@@ -164,13 +228,11 @@ def soup_clean_text(html: str, max_chars: int = 8000) -> str:
     if md and md.get("content"):
         parts.append(f"DESCRIPTION: {md.get('content','').strip()}")
 
-    # Headings for structure
     for h in soup.find_all(["h1", "h2", "h3"]):
         t = h.get_text(" ", strip=True)
         if t and len(t) > 20:
             parts.append(f"HEADING: {t}")
 
-    # A few substantial paragraphs
     p_count = 0
     for p in soup.find_all("p"):
         t = p.get_text(" ", strip=True)
@@ -183,7 +245,6 @@ def soup_clean_text(html: str, max_chars: int = 8000) -> str:
     text = " ".join(parts)
     text = re.sub(r"\s+", " ", text).strip()
     return text[:max_chars]
-
 
 def extract_title(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
@@ -203,26 +264,16 @@ def extract_title(html: str) -> str:
 # Fetch helpers
 # -------------------------
 async def fetch_html(http: httpx.AsyncClient, url: str) -> str:
-    if not is_sgi_url(url) and urlparse(url).netloc != urlparse(ensure_http(url)).netloc:
-        # This guard is mostly for SGI fetches; company URL may be external.
-        pass
-
     r = await http.get(url, timeout=TIMEOUT, follow_redirects=True)
     r.raise_for_status()
     return r.text
-
-async def fetch_text(http: httpx.AsyncClient, url: str, max_chars: int = 8000) -> str:
-    html = await fetch_html(http, url)
-    return soup_clean_text(html, max_chars=max_chars)
 
 
 # -------------------------
 # Crawl SGI (SGI-only)
 # -------------------------
-# Accept SGI content patterns, but do NOT rely solely on them (site structure may change).
-# This is just a “priority” hint, not a security filter.
 PREFER_PATTERNS = re.compile(
-    r"(\.article$)|"            # common SGI article ending
+    r"(\.article$)|"
     r"(/home/topics)|"
     r"(/brands/)|(/retail/)|(/financial/)|(/technology/)|(/legal/)|"
     r"(/distribution/)|(/sourcing/)|(/consumer/)|(/corporate/)|(/people/)|"
@@ -235,10 +286,6 @@ def sort_prefer(urls: List[str]) -> List[str]:
     return preferred + other
 
 async def discover_topic_pages(http: httpx.AsyncClient) -> List[str]:
-    """
-    Pull topic pages from /home/topics like:
-    /home/topics/retail, /home/topics/financial, etc.
-    """
     topics_url = "https://www.sgieurope.com/home/topics"
     try:
         html = await fetch_html(http, topics_url)
@@ -250,11 +297,9 @@ async def discover_topic_pages(http: httpx.AsyncClient) -> List[str]:
     seen: Set[str] = set()
 
     for a in soup.find_all("a", href=True):
-        href = a.get("href", "")
-        full = absolutize_sgi(href)
+        full = absolutize_sgi(a.get("href", ""))
         if not full:
             continue
-        # specifically capture /home/topics/... pages
         if "/home/topics/" in full.lower() and full not in seen:
             seen.add(full)
             topic_pages.append(full)
@@ -264,16 +309,7 @@ async def discover_topic_pages(http: httpx.AsyncClient) -> List[str]:
     return topic_pages
 
 async def collect_sgi_links(http: httpx.AsyncClient) -> List[str]:
-    """
-    SGI-only link collection:
-    - Crawl SEED_PAGES
-    - Crawl discovered topic pages from /home/topics
-    - Collect internal links from those pages
-    - Return a prioritized list of SGI URLs
-    """
     to_crawl = list(SEED_PAGES)
-
-    # Add topic pages
     topic_pages = await discover_topic_pages(http)
     to_crawl.extend(topic_pages)
 
@@ -299,11 +335,6 @@ async def collect_sgi_links(http: httpx.AsyncClient) -> List[str]:
             if not full:
                 continue
 
-            # hard SGI-only guarantee:
-            if not is_sgi_url(full):
-                continue
-
-            # avoid obvious junk routes
             lower = full.lower()
             if any(x in lower for x in ["/login", "/subscribe", "/account", "/search?"]):
                 continue
@@ -320,12 +351,8 @@ async def collect_sgi_links(http: httpx.AsyncClient) -> List[str]:
         if len(collected) >= MAX_LINKS_TOTAL:
             break
 
-    # prioritize likely article/content pages first
     collected = sort_prefer(collected)
-
-    # also ensure SGI-only (again, belt + braces)
     collected = [u for u in collected if is_sgi_url(u)]
-
     return collected[:MAX_LINKS_TOTAL]
 
 
@@ -358,8 +385,12 @@ def heuristic_score(job: str, company_text: str, sgi_text: str) -> Dict[str, Any
 
 
 # -------------------------
-# AI helpers (optional)
+# AI helpers (optional; graceful fallback on quota)
 # -------------------------
+def is_openai_quota_error(e: Exception) -> bool:
+    msg = str(e).lower()
+    return ("insufficient_quota" in msg) or ("error code: 429" in msg) or ("quota" in msg)
+
 async def ai_summarize(text: str) -> str:
     if not AI_ENABLED:
         return (text[:280] + "…") if len(text) > 280 else text
@@ -381,7 +412,8 @@ async def ai_summarize(text: str) -> str:
             ],
         )
         return resp.choices[0].message.content.strip()
-    except Exception:
+    except Exception as e:
+        # quota / outage -> fallback
         return (text[:280] + "…") if len(text) > 280 else text
 
 async def ai_relevance(job: str, company_text: str, sgi_title: str, sgi_url: str, sgi_summary: str) -> Dict[str, Any]:
@@ -437,7 +469,6 @@ Return STRICT JSON only with keys: score (number), reason (string).
 # Build SGI candidate (SGI-only)
 # -------------------------
 async def fetch_sgi_candidate(http: httpx.AsyncClient, url: str) -> Optional[Dict[str, Any]]:
-    # Hard stop: never fetch non-SGI
     if not is_sgi_url(url):
         return None
 
@@ -449,7 +480,6 @@ async def fetch_sgi_candidate(http: httpx.AsyncClient, url: str) -> Optional[Dic
     title = extract_title(html)
     text = soup_clean_text(html, max_chars=9000)
 
-    # Filter out ultra-thin pages
     if len(text) < 350:
         return None
 
@@ -464,9 +494,13 @@ async def fetch_sgi_candidate(http: httpx.AsyncClient, url: str) -> Optional[Dic
 
 
 # -------------------------
-# Main recommendation flow
+# Main recommendation flow (WITH progress callbacks)
 # -------------------------
-async def recommend_for_user(job_title: str, website_url: str) -> Dict[str, Any]:
+async def recommend_for_user(
+    job_title: str,
+    website_url: str,
+    task_id: Optional[str] = None
+) -> Dict[str, Any]:
     job_title = (job_title or "").strip()
     website_url = ensure_http(website_url)
 
@@ -475,32 +509,50 @@ async def recommend_for_user(job_title: str, website_url: str) -> Dict[str, Any]
     if not website_url:
         raise HTTPException(status_code=422, detail="website_url is required.")
 
+    async def bump(pct: int, step: str):
+        if task_id:
+            await set_task(task_id, pct=pct, step=step)
+
+    await bump(5, "Validating inputs…")
+
     async with httpx.AsyncClient(headers=DEFAULT_HEADERS) as http:
-        # 1) Scrape visitor company website (can be any domain)
+        # 1) Scrape visitor company website
+        await bump(12, "Fetching your website…")
         try:
             company_html = await fetch_html(http, website_url)
             company_text = soup_clean_text(company_html, max_chars=6500)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Failed to fetch website_url: {str(e)}")
 
+        await bump(28, "Understanding what your company does…")
+
         # 2) Collect SGI-only links
+        await bump(40, "Collecting SGI Europe topics & links…")
         sgi_links = await collect_sgi_links(http)
-        sgi_links = [u for u in sgi_links if is_sgi_url(u)]  # hard re-check
+        sgi_links = [u for u in sgi_links if is_sgi_url(u)]
 
         if not sgi_links:
+            await bump(100, "Done")
             return {"articles": [], "error": None}
 
         # 3) Fetch SGI pages concurrently (limit)
+        await bump(55, "Fetching SGI pages…")
         selected = sgi_links[:MAX_PAGES_FETCH]
         candidates = await asyncio.gather(*[fetch_sgi_candidate(http, u) for u in selected])
         candidates = [c for c in candidates if c and is_sgi_url(c["url"])]
 
         if not candidates:
+            await bump(100, "Done")
             return {"articles": [], "error": None}
 
         # 4) Score relevance
+        await bump(72, "Scoring relevance to your role…")
         scored = []
-        for c in candidates:
+        for i, c in enumerate(candidates):
+            # small progress increments during scoring
+            step_pct = 72 + int((i / max(1, len(candidates))) * 18)
+            await bump(step_pct, f"Ranking SGI pages… ({i+1}/{len(candidates)})")
+
             rel = await ai_relevance(
                 job=job_title,
                 company_text=company_text,
@@ -518,20 +570,114 @@ async def recommend_for_user(job_title: str, website_url: str) -> Dict[str, Any]
 
         scored.sort(key=lambda x: x["relevance_score"], reverse=True)
 
+        await bump(94, "Finalising top results…")
+
         # 5) Return top (SGI-only guarantee)
         top = [a for a in scored if is_sgi_url(a["url"])][:RETURN_TOP]
+
+        await bump(100, "Done")
         return {"articles": top, "error": None}
 
 
 # -------------------------
-# API endpoint
+# Blocking endpoint (works with simple widget fetch)
 # -------------------------
 @app.post("/recommend")
 async def recommend(req: RecommendRequest):
     try:
-        return await recommend_for_user(req.job_title, req.website_url)
+        return await recommend_for_user(req.job_title, req.website_url, task_id=None)
     except HTTPException:
         raise
     except Exception as e:
         print("🔥 ERROR:", str(e))
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# -------------------------
+# Async job start (for REAL progress bar)
+# -------------------------
+@app.post("/recommend_async")
+async def recommend_async(req: RecommendRequest):
+    """
+    Returns a task_id immediately, then compute runs in background.
+    Widget connects to /progress/{task_id} to receive progress + final result.
+    """
+    await cleanup_tasks()
+
+    task_id = uuid.uuid4().hex
+    await create_task_record(task_id)
+    await set_task(task_id, pct=1, step="Queued…")
+
+    async def runner():
+        try:
+            result = await recommend_for_user(req.job_title, req.website_url, task_id=task_id)
+            await set_task(task_id, done=True, pct=100, step="Done", result=result, error=None)
+        except HTTPException as he:
+            await set_task(task_id, done=True, pct=100, step="Error", result=None, error=str(he.detail))
+        except Exception as e:
+            await set_task(task_id, done=True, pct=100, step="Error", result=None, error=str(e))
+
+    # Fire-and-forget (single instance)
+    asyncio.create_task(runner())
+
+    return {"task_id": task_id}
+
+
+# -------------------------
+# SSE progress stream
+# -------------------------
+@app.get("/progress/{task_id}")
+async def progress(task_id: str):
+    """
+    Server-Sent Events:
+    - event: progress  data: {"pct":..,"step":..,"done":false}
+    - event: done      data: {"pct":100,"step":"Done","done":true,"result":{...}}
+    - event: error     data: {"pct":100,"step":"Error","done":true,"error":"..."}
+    """
+    async def event_gen():
+        # initial check
+        async with TASK_LOCK:
+            if task_id not in TASKS:
+                payload = {"pct": 100, "step": "Unknown task_id", "done": True, "error": "Unknown task_id"}
+                yield f"event: error\ndata: {json.dumps(payload)}\n\n"
+                return
+
+        last_sent = None
+
+        while True:
+            await asyncio.sleep(0.25)
+
+            async with TASK_LOCK:
+                t = TASKS.get(task_id)
+
+            if not t:
+                payload = {"pct": 100, "step": "Task expired", "done": True, "error": "Task expired"}
+                yield f"event: error\ndata: {json.dumps(payload)}\n\n"
+                return
+
+            snapshot = {
+                "pct": int(t.get("pct", 0)),
+                "step": t.get("step", ""),
+                "done": bool(t.get("done", False)),
+            }
+
+            if t.get("error"):
+                snapshot["error"] = t["error"]
+
+            if t.get("done") and t.get("result"):
+                snapshot["result"] = t["result"]
+
+            # avoid sending identical frames repeatedly
+            key = json.dumps(snapshot, sort_keys=True)
+            if key != last_sent:
+                last_sent = key
+                if snapshot.get("done") and snapshot.get("error"):
+                    yield f"event: error\ndata: {json.dumps(snapshot)}\n\n"
+                    return
+                if snapshot.get("done"):
+                    yield f"event: done\ndata: {json.dumps(snapshot)}\n\n"
+                    return
+                else:
+                    yield f"event: progress\ndata: {json.dumps(snapshot)}\n\n"
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
