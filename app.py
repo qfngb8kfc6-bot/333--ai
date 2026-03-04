@@ -1,7 +1,11 @@
 # ============================================================
 # app.py  (COPY + PASTE READY)
-# SGI-ONLY RECOMMENDER (RSS + CACHE + FAST)
-# Uses: https://www.sgieurope.com/3764.fullrss
+# SGI-ONLY RECOMMENDER (RSS + CACHE + REAL PROGRESS EVENTS)
+#
+# Adds: POST /recommend_stream  (SSE text/event-stream)
+# Also keeps: POST /recommend    (normal JSON)
+#
+# Hard guarantee: only returns https://www.sgieurope.com links
 # ============================================================
 
 import os
@@ -14,8 +18,10 @@ from urllib.parse import urlparse
 
 import httpx
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException
+
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 # OpenAI optional (app runs without it)
@@ -41,11 +47,11 @@ DEFAULT_HEADERS = {
 
 # Speed knobs
 RSS_CACHE_SECONDS = 20 * 60           # refresh RSS every 20 minutes
-RSS_MAX_ITEMS = 40                   # how many RSS items to keep in cache
-CANDIDATES_FOR_AI = 10               # how many to run AI on (keep small!)
-RETURN_TOP = 6                       # return top N
+RSS_MAX_ITEMS = 40                    # how many RSS items to keep in cache
+CANDIDATES_FOR_AI = 10                # how many candidates to fully score
+RETURN_TOP = 6                        # how many to return
 
-# If you want even faster, set this True to avoid fetching full article HTML
+# If True: fastest — use RSS description only (no SGI HTML fetches)
 USE_RSS_DESCRIPTION_ONLY = True
 
 # Concurrency limits
@@ -62,7 +68,8 @@ client = OpenAI(api_key=OPENAI_API_KEY) if AI_ENABLED else None
 # -------------------------
 app = FastAPI()
 
-# allow widget usage anywhere while testing
+# Allow widget usage from anywhere while testing.
+# Tighten later to ["https://www.sgieurope.com"] once embedded there.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -89,6 +96,7 @@ def root():
         "status": "SGI RSS Recommender running",
         "ai_enabled": AI_ENABLED,
         "rss": SGI_RSS_URL,
+        "stream": "/recommend_stream",
     }
 
 @app.get("/healthz")
@@ -139,7 +147,6 @@ def soup_clean_text(html: str, max_chars: int = 6500) -> str:
     if md and md.get("content"):
         parts.append(f"DESCRIPTION: {md.get('content','').strip()}")
 
-    # Grab a few meaningful headings
     for h in soup.find_all(["h1", "h2", "h3"]):
         t = h.get_text(" ", strip=True)
         if t and len(t) > 12:
@@ -147,7 +154,6 @@ def soup_clean_text(html: str, max_chars: int = 6500) -> str:
         if len(parts) >= 10:
             break
 
-    # Grab substantial paragraphs
     p_count = 0
     for p in soup.find_all("p"):
         t = p.get_text(" ", strip=True)
@@ -160,13 +166,7 @@ def soup_clean_text(html: str, max_chars: int = 6500) -> str:
     text = re.sub(r"\s+", " ", " ".join(parts)).strip()
     return text[:max_chars]
 
-
 def quick_company_signal(html: str) -> str:
-    """
-    Very fast extraction from company homepage:
-    - title/meta description
-    - a few headings/paragraphs
-    """
     return soup_clean_text(html, max_chars=4500)
 
 
@@ -175,17 +175,12 @@ def quick_company_signal(html: str) -> str:
 # -------------------------
 _RSS_CACHE: Dict[str, Any] = {
     "ts": 0,
-    "items": [],   # list of {title, link, description, pubDate}
+    "items": [],
 }
 
 def _parse_rss_xml(xml_text: str) -> List[Dict[str, str]]:
-    """
-    Parse RSS XML without extra dependencies.
-    Returns list of items with title/link/description/pubDate.
-    """
     import xml.etree.ElementTree as ET
 
-    # Some RSS feeds have namespaces; handle loosely
     try:
         root = ET.fromstring(xml_text)
     except Exception:
@@ -200,7 +195,6 @@ def _parse_rss_xml(xml_text: str) -> List[Dict[str, str]]:
 
         link = normalize_url(link)
 
-        # SGI-only hard filter
         if not link or not is_sgi_url(link):
             continue
 
@@ -213,11 +207,7 @@ def _parse_rss_xml(xml_text: str) -> List[Dict[str, str]]:
 
     return items
 
-
 async def _refresh_rss_if_needed(http: httpx.AsyncClient) -> Tuple[List[Dict[str, Any]], bool]:
-    """
-    Returns (items, from_cache)
-    """
     now = time.time()
     if _RSS_CACHE["items"] and (now - _RSS_CACHE["ts"] < RSS_CACHE_SECONDS):
         return _RSS_CACHE["items"], True
@@ -225,9 +215,7 @@ async def _refresh_rss_if_needed(http: httpx.AsyncClient) -> Tuple[List[Dict[str
     r = await http.get(SGI_RSS_URL, timeout=TIMEOUT, follow_redirects=True)
     r.raise_for_status()
 
-    items = _parse_rss_xml(r.text)
-    items = items[:RSS_MAX_ITEMS]
-
+    items = _parse_rss_xml(r.text)[:RSS_MAX_ITEMS]
     _RSS_CACHE["ts"] = now
     _RSS_CACHE["items"] = items
     return items, False
@@ -256,9 +244,9 @@ def heuristic_score(job_title: str, company_signal: str, sgi_title: str, sgi_des
     k1 = set(keywords(base, 28))
     k2 = set(keywords(" ".join([sgi_title or "", sgi_desc or ""]), 28))
     overlap = k1.intersection(k2)
+
     score = min(100, int(len(overlap) * 9))
     if score < 20 and (job_title or "").strip():
-        # small floor so you still get something
         score = min(35, score + 12)
 
     reason = "Matched keywords: " + (", ".join(sorted(list(overlap))[:10]) if overlap else "no strong overlap")
@@ -275,16 +263,8 @@ async def ai_score_and_summarize(
     sgi_url: str,
     sgi_text: str,
 ) -> Dict[str, Any]:
-    """
-    One AI call that returns:
-    - summary (2-3 sentences)
-    - score 0-100
-    - reason (1-2 sentences, personalized)
-    """
     if not AI_ENABLED:
-        # fallback
         score, reason = heuristic_score(job_title, company_signal, sgi_title, sgi_text)
-        # "summary" fallback: truncate
         clean = re.sub(r"\s+", " ", (sgi_text or "")).strip()
         summary = clean[:260] + ("…" if len(clean) > 260 else "")
         return {"score": score, "reason": reason, "summary": summary}
@@ -344,7 +324,6 @@ Return STRICT JSON only with these keys:
         return {"score": score, "reason": reason[:500], "summary": summary[:700]}
 
     except Exception:
-        # fallback if quota/network error
         score, reason = heuristic_score(job_title, company_signal, sgi_title, sgi_text)
         clean = re.sub(r"\s+", " ", (sgi_text or "")).strip()
         summary = clean[:260] + ("…" if len(clean) > 260 else "")
@@ -363,12 +342,23 @@ async def fetch_sgi_text(http: httpx.AsyncClient, url: str) -> str:
 
 
 # -------------------------
-# Main endpoint logic
+# Core recommend (used by /recommend and /recommend_stream)
+# progress_cb(percent:int, message:str, stage:str, extra:dict|None)
 # -------------------------
-@app.post("/recommend")
-async def recommend(req: RecommendRequest):
-    job_title = (req.job_title or "").strip()
-    website_url = ensure_http(req.website_url)
+async def recommend_core(
+    job_title: str,
+    website_url: str,
+    progress_cb=None,
+) -> Dict[str, Any]:
+    def prog(p: int, msg: str, stage: str, extra: Optional[Dict[str, Any]] = None):
+        if progress_cb:
+            try:
+                progress_cb(p, msg, stage, extra or {})
+            except Exception:
+                pass
+
+    job_title = (job_title or "").strip()
+    website_url = ensure_http(website_url)
 
     if not job_title:
         raise HTTPException(status_code=422, detail="job_title is required.")
@@ -378,7 +368,8 @@ async def recommend(req: RecommendRequest):
     sem = asyncio.Semaphore(FETCH_CONCURRENCY)
 
     async with httpx.AsyncClient(headers=DEFAULT_HEADERS) as http:
-        # 1) Scrape visitor company website (only 1 request)
+        # 1) Visitor site
+        prog(8, "Fetching your website…", "fetch_company")
         try:
             company_resp = await http.get(website_url, timeout=TIMEOUT, follow_redirects=True)
             company_resp.raise_for_status()
@@ -386,16 +377,19 @@ async def recommend(req: RecommendRequest):
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Failed to fetch website_url: {str(e)}")
 
-        # 2) Get SGI RSS items (cached)
-        try:
-            rss_items, from_cache = await _refresh_rss_if_needed(http)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to fetch SGI RSS feed: {str(e)}")
+        prog(22, "Understanding what your company does…", "parse_company")
+
+        # 2) RSS (cached)
+        prog(30, "Loading SGI latest content…", "fetch_rss")
+        rss_items, from_cache = await _refresh_rss_if_needed(http)
 
         if not rss_items:
+            prog(100, "Done", "done", {"count": 0})
             return {"articles": [], "error": None, "meta": {"source": "rss", "cached": from_cache}}
 
-        # 3) Cheap pre-rank using heuristic overlap on title + rss description
+        prog(40, "Shortlisting likely matches…", "shortlist", {"rss_items_seen": len(rss_items)})
+
+        # 3) cheap pre-rank
         ranked = []
         for item in rss_items:
             title = item.get("title", "Untitled")
@@ -407,25 +401,29 @@ async def recommend(req: RecommendRequest):
             ranked.append((score, item))
 
         ranked.sort(key=lambda x: x[0], reverse=True)
-
-        # Keep only top candidates for AI (fast)
         candidates = [it for _, it in ranked[:max(CANDIDATES_FOR_AI, RETURN_TOP)]]
 
-        # 4) Prepare content for each candidate
-        async def build_one(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        prog(50, "Analyzing candidate articles…", "analyze_candidates", {"candidates": len(candidates)})
+
+        # 4) build each item
+        total = len(candidates)
+        if total == 0:
+            prog(100, "Done", "done", {"count": 0})
+            return {"articles": [], "error": None, "meta": {"source": "rss", "cached": from_cache}}
+
+        async def build_one(i: int, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             url = item.get("url", "")
             if not is_sgi_url(url):
                 return None
 
             title = item.get("title", "Untitled")
-            desc = re.sub(r"<[^>]+>", " ", (item.get("description") or ""))  # strip any HTML in RSS desc
+            desc = re.sub(r"<[^>]+>", " ", (item.get("description") or ""))
             desc = re.sub(r"\s+", " ", desc).strip()
 
-            # Option: use RSS description only (fastest)
+            # optional SGI HTML fetch
             if USE_RSS_DESCRIPTION_ONLY and desc:
                 sgi_text = desc
             else:
-                # fetch full SGI page text (slower)
                 async with sem:
                     try:
                         sgi_text = await fetch_sgi_text(http, url)
@@ -434,6 +432,13 @@ async def recommend(req: RecommendRequest):
 
             if not sgi_text or len(sgi_text) < 80:
                 sgi_text = desc or ""
+
+            # progress: 55..92 based on items completed
+            base_start = 55
+            base_end = 92
+            done_so_far = i  # 0-based in loop
+            approx = base_start + int((base_end - base_start) * (done_so_far / max(1, total)))
+            prog(approx, f"Scoring article {i+1}/{total}…", "score_one", {"index": i + 1, "total": total})
 
             ai = await ai_score_and_summarize(
                 job_title=job_title,
@@ -451,11 +456,19 @@ async def recommend(req: RecommendRequest):
                 "relevance_reason": ai["reason"],
             }
 
-        results = await asyncio.gather(*[build_one(it) for it in candidates])
-        results = [r for r in results if r and is_sgi_url(r["url"])]
+        # sequential keeps progress more “true”
+        results: List[Dict[str, Any]] = []
+        for i, it in enumerate(candidates):
+            r = await build_one(i, it)
+            if r and is_sgi_url(r["url"]):
+                results.append(r)
+
+        prog(94, "Ranking best matches…", "rank_results")
 
         results.sort(key=lambda x: x["relevance_score"], reverse=True)
         top = results[:RETURN_TOP]
+
+        prog(100, "Done ✅", "done", {"count": len(top)})
 
         return {
             "articles": top,
@@ -469,3 +482,79 @@ async def recommend(req: RecommendRequest):
                 "use_rss_description_only": USE_RSS_DESCRIPTION_ONLY,
             },
         }
+
+
+# -------------------------
+# Normal JSON endpoint (kept)
+# -------------------------
+@app.post("/recommend")
+async def recommend(req: RecommendRequest):
+    try:
+        return await recommend_core(req.job_title, req.website_url, progress_cb=None)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# -------------------------
+# SSE streaming endpoint (REAL progress)
+# POST /recommend_stream
+# Body: { job_title, website_url }
+# Response: text/event-stream with events:
+#   event: progress  data: {"percent":..,"message":..,"stage":..,"extra":{...}}
+#   event: result    data: {"articles":[...], "meta":{...}}
+#   event: error     data: {"detail":"..."}
+# -------------------------
+@app.post("/recommend_stream")
+async def recommend_stream(req: RecommendRequest, request: Request):
+    async def event_gen():
+        queue: asyncio.Queue = asyncio.Queue()
+
+        def progress_cb(percent: int, message: str, stage: str, extra: Dict[str, Any]):
+            payload = {"percent": percent, "message": message, "stage": stage, "extra": extra or {}}
+            queue.put_nowait(("progress", payload))
+
+        async def run_job():
+            try:
+                result = await recommend_core(req.job_title, req.website_url, progress_cb=progress_cb)
+                queue.put_nowait(("result", result))
+            except HTTPException as e:
+                queue.put_nowait(("error", {"detail": e.detail}))
+            except Exception as e:
+                queue.put_nowait(("error", {"detail": str(e)}))
+
+        task = asyncio.create_task(run_job())
+
+        # Initial ping
+        yield "event: progress\ndata: " + json.dumps({"percent": 1, "message": "Starting…", "stage": "start", "extra": {}}) + "\n\n"
+
+        try:
+            while True:
+                # client disconnected?
+                if await request.is_disconnected():
+                    task.cancel()
+                    break
+
+                try:
+                    event, data = await asyncio.wait_for(queue.get(), timeout=10)
+                except asyncio.TimeoutError:
+                    # keep-alive comment
+                    yield ": keep-alive\n\n"
+                    continue
+
+                yield f"event: {event}\n"
+                yield "data: " + json.dumps(data) + "\n\n"
+
+                if event in ("result", "error"):
+                    break
+        finally:
+            if not task.done():
+                task.cancel()
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "Content-Type": "text/event-stream",
+    }
+    return StreamingResponse(event_gen(), headers=headers)
